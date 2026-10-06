@@ -14,6 +14,11 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # must be called as "${SCRIPT_DIR}/<name>.sh" (a relative $(dirname "$0") no longer resolves)
 SCRIPT_DIR="${PROJECT_DIR}/scripts"
 cd "${PROJECT_DIR}" || exit 1
+# .env is git-ignored (holds your broker credentials); seed it from the committed sample on first use
+if [ ! -f .env ]; then
+  cp env.example .env
+  echo "Created .env from env.example - review it (SOLACE_*, REALM, ports) and re-run if you change anything." >&2
+fi
 set -a
 # shellcheck disable=SC1091
 source .env

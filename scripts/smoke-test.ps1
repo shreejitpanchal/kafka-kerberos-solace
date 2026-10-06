@@ -4,7 +4,11 @@
 $ErrorActionPreference = "Continue"
 Set-Location (Join-Path $PSScriptRoot "..")
 
-# load .env
+# load .env (seed it from the committed sample on first use)
+if (-not (Test-Path .env)) {
+    Copy-Item env.example .env
+    Write-Host "Created .env from env.example - review it (SOLACE_*, REALM, ports)."
+}
 $env_ = @{}
 Get-Content .env | Where-Object { $_ -match '^\s*[^#].*=' } | ForEach-Object {
     $k, $v = $_ -split '=', 2; $env_[$k.Trim()] = $v.Trim()

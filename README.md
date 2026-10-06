@@ -78,7 +78,8 @@ Data flows that are wired up out of the box:
 
 ```bash
 cd kafka-kerberos-solace
-scripts/up.sh
+cp env.example .env     # sample config; .env is git-ignored. Adjust SOLACE_* / ports / REALM if needed
+scripts/up.sh           # (creates .env from env.example itself if you skip the cp)
 ```
 
 `scripts/up.sh` = `docker compose up -d --build` + `scripts/check-solace.sh` (SEMP reachable, broker
