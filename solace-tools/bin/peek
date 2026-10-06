@@ -1,0 +1,10 @@
+#!/bin/bash
+# peek [topic-filter] [seconds]   - watch Solace topics live over MQTT (default kafka/# for 20s)
+# Records that the Kafka receiver pulls from Kafka appear on Solace topic kafka/<kafka-topic>.
+set -euo pipefail
+source /opt/tools/lib.sh
+FILTER="${1:-kafka/#}"
+SECS="${2:-20}"
+log "subscribing to '${FILTER}' on ${SOLACE_MQTT_HOST}:${SOLACE_MQTT_PORT} for ${SECS}s (Ctrl-C to stop)"
+mosquitto_sub -h "${SOLACE_MQTT_HOST}" -p "${SOLACE_MQTT_PORT}" -t "${FILTER}" -v -W "${SECS}" \
+  -i "peek-$$" || true

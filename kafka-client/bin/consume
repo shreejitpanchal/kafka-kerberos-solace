@@ -1,0 +1,22 @@
+#!/bin/bash
+# consume <topic> [timeout-seconds]   - print messages (from beginning), exits after timeout
+# examples:
+#   consume orders-out            (15s)
+#   consume orders-out 60
+set -euo pipefail
+source /opt/tools/lib.sh
+
+TOPIC="${1:-}"; [ -n "${TOPIC}" ] || { echo "usage: consume <topic> [timeout-seconds]" >&2; exit 2; }
+TIMEOUT_S="${2:-15}"
+
+log "consuming ${TOPIC} for ${TIMEOUT_S}s ..."
+kafka-console-consumer.sh \
+  --bootstrap-server "${BOOTSTRAP}" \
+  --consumer.config "${PROPS}" \
+  --topic "${TOPIC}" \
+  --from-beginning \
+  --timeout-ms "$(( TIMEOUT_S * 1000 ))" \
+  --property print.timestamp=true \
+  --property print.key=true \
+  --property print.partition=true \
+  --property print.offset=true 2>/dev/null || true

@@ -1,0 +1,28 @@
+#!/bin/bash
+# produce <topic> [message ...]   - send one message (or stdin lines) to Kafka
+# examples:
+#   produce orders-in "hello from kafka"
+#   produce orders-in "key1:value1"            (key:value if --key is given)
+#   echo "line" | produce orders-in
+set -euo pipefail
+source /opt/tools/lib.sh
+
+usage() { echo "usage: produce [--key] <topic> [message ...]" >&2; exit 2; }
+
+KEYED=0
+if [ "${1:-}" = "--key" ]; then KEYED=1; shift; fi
+TOPIC="${1:-}"; [ -n "${TOPIC}" ] || usage
+shift || true
+
+ARGS=(--bootstrap-server "${BOOTSTRAP}" --topic "${TOPIC}" --producer.config "${PROPS}")
+if [ "${KEYED}" = "1" ]; then
+  ARGS+=(--property parse.key=true --property key.separator=:)
+fi
+
+if [ $# -gt 0 ]; then
+  printf '%s\n' "$*" | kafka-console-producer.sh "${ARGS[@]}"
+  log "sent 1 message to ${TOPIC}"
+else
+  log "reading messages from stdin (one per line, Ctrl-D to finish)"
+  kafka-console-producer.sh "${ARGS[@]}"
+fi

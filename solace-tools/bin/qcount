@@ -1,0 +1,14 @@
+#!/bin/bash
+# qcount <queue>   - print the number of messages currently spooled on a queue
+set -euo pipefail
+source /opt/tools/lib.sh
+Q="${1:-${Q_FROM_KAFKA}}"
+semp GET "${MON}/msgVpns/${VPN}/queues/$(urlenc "${Q}")"
+[ "${HTTP_CODE}" = "200" ] || die "HTTP ${HTTP_CODE} reading queue ${Q}: $(semp_err)"
+n=$(echo "${RESP}" | jq -r '.data.spooledMsgCount // empty')
+if [ -z "${n}" ]; then
+  # fallback: count the msgs collection instead
+  semp GET "${MON}/msgVpns/${VPN}/queues/$(urlenc "${Q}")/msgs?count=100"
+  n=$(echo "${RESP}" | jq -r '.data | length')
+fi
+echo "${n}"

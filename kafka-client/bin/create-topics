@@ -1,0 +1,21 @@
+#!/bin/bash
+# create-topics <topic> [<topic> ...]   - idempotent topic creation (3 partitions, RF 1)
+set -euo pipefail
+source /opt/tools/lib.sh
+[ $# -gt 0 ] || { echo "usage: create-topics <topic> [...]" >&2; exit 2; }
+
+# wait until the broker answers an authenticated metadata request
+for i in $(seq 1 30); do
+  if kafka-broker-api-versions.sh --bootstrap-server "${BOOTSTRAP}" --command-config "${PROPS}" >/dev/null 2>&1; then
+    break
+  fi
+  log "waiting for Kafka (Kerberos auth) ... ${i}/30"
+  sleep 3
+done
+
+for t in "$@"; do
+  kafka-topics.sh --bootstrap-server "${BOOTSTRAP}" --command-config "${PROPS}" \
+    --create --if-not-exists --topic "${t}" --partitions 3 --replication-factor 1
+  log "topic ready: ${t}"
+done
+kafka-topics.sh --bootstrap-server "${BOOTSTRAP}" --command-config "${PROPS}" --list

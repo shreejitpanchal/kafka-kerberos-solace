@@ -1,0 +1,235 @@
+# =====================================================================
+#  Lightweight Kafka (KRaft) + MIT Kerberos KDC, bridged to an EXISTING
+#  Solace PubSub+ container over SASL/GSSAPI using a keytab.
+#
+#  The Solace broker is NOT part of this file. It is reached through the
+#  ports it publishes on your PC (PubSub+ Manager = https://localhost:1943),
+#  which from inside a container is  https://host.docker.internal:1943.
+#  The KDC (88) and Kafka (9093) publish host ports too, so the broker
+#  reaches them as host.docker.internal:88 / host.docker.internal:9093
+#  without being attached to any compose network.
+#
+#  Start:   scripts/up.sh                 (= compose up + broker checks + configure)
+#  Status:  docker compose run --rm solace-tools status
+#  Stop:    docker compose down           (keep KDC db + keytabs)
+#  Reset:   docker compose down -v        (wipe KDC db + keytabs)
+# =====================================================================
+name: kafka-kerberos-solace
+
+networks:
+  default:
+    name: ${COMPOSE_NETWORK:-kafka-kerberos-net}
+
+services:
+
+  # ------------------------------------------------------------------
+  # 1. Kerberos KDC (MIT krb5 on Alpine). On first start it creates the
+  #    realm, the principals and the keytabs, then serves tickets.
+  #    Kafka gets TWO service principals: kafka/kafka (in-network name)
+  #    and kafka/<HOST_ALIAS> (the name the Solace broker connects to).
+  # ------------------------------------------------------------------
+  kdc:
+    build: ./kdc
+    image: kafka-kerberos-solace/kdc
+    container_name: kdc
+    hostname: kdc
+    environment:
+      REALM: ${REALM}
+      KDC_HOST: kdc
+      KAFKA_HOST: kafka
+      KAFKA_EXTERNAL_HOST: ${HOST_ALIAS}
+      KAFKA_SERVICE_NAME: ${KAFKA_SERVICE_NAME}
+      SOLACE_PRINCIPAL: ${SOLACE_PRINCIPAL}
+      CLIENT_PRINCIPAL: ${CLIENT_PRINCIPAL}
+      KDC_MASTER_PASSWORD: ${KDC_MASTER_PASSWORD}
+      KADMIN_PASSWORD: ${KADMIN_PASSWORD}
+    volumes:
+      - kdc-data:/var/lib/krb5kdc
+      - keytabs:/keytabs
+      - krb5conf:/krb5
+    ports:
+      # the Solace broker reaches the KDC as <HOST_ALIAS>:<KDC_HOST_PORT>
+      - "${KDC_HOST_PORT:-88}:88/tcp"
+      - "${KDC_HOST_PORT:-88}:88/udp"
+    healthcheck:
+      test: ["CMD", "/healthcheck.sh"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 5s
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # 2. Apache Kafka, single node, KRaft combined mode (no ZooKeeper).
+  #    Two SASL_PLAINTEXT/GSSAPI listeners, each with its own principal:
+  #      INTERNAL  kafka:9093                  -> kafka/kafka@REALM        (inter-broker, kafka-client)
+  #      EXTERNAL  <HOST_ALIAS>:<KAFKA_HOST_PORT> -> kafka/<HOST_ALIAS>@REALM (Solace, via published port)
+  # ------------------------------------------------------------------
+  kafka:
+    image: ${KAFKA_IMAGE}
+    container_name: kafka
+    hostname: kafka
+    depends_on:
+      kdc:
+        condition: service_healthy
+    environment:
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9094
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9093,CONTROLLER://0.0.0.0:9094,EXTERNAL://0.0.0.0:9095
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9093,EXTERNAL://${HOST_ALIAS}:${KAFKA_HOST_PORT:-9093}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:SASL_PLAINTEXT,EXTERNAL:SASL_PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # --- SASL / Kerberos ---
+      KAFKA_SASL_ENABLED_MECHANISMS: GSSAPI
+      KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: GSSAPI
+      KAFKA_SASL_KERBEROS_SERVICE_NAME: ${KAFKA_SERVICE_NAME}
+      # listener.name.internal.gssapi.sasl.jaas.config   (image rule: "." -> "_")
+      KAFKA_LISTENER_NAME_INTERNAL_GSSAPI_SASL_JAAS_CONFIG: >-
+        com.sun.security.auth.module.Krb5LoginModule required
+        useKeyTab=true storeKey=true
+        keyTab="/etc/kafka/keytabs/kafka.keytab"
+        principal="${KAFKA_SERVICE_NAME}/kafka@${REALM}";
+      # listener.name.external.gssapi.sasl.jaas.config
+      KAFKA_LISTENER_NAME_EXTERNAL_GSSAPI_SASL_JAAS_CONFIG: >-
+        com.sun.security.auth.module.Krb5LoginModule required
+        useKeyTab=true storeKey=true
+        keyTab="/etc/kafka/keytabs/kafka.keytab"
+        principal="${KAFKA_SERVICE_NAME}/${HOST_ALIAS}@${REALM}";
+      KAFKA_OPTS: -Djava.security.krb5.conf=/etc/krb5/krb5.conf -Dsun.security.krb5.debug=false
+      # --- single node sizing ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 24
+    volumes:
+      - keytabs:/etc/kafka/keytabs:ro
+      - krb5conf:/etc/krb5:ro
+    ports:
+      # the Solace broker reaches Kafka as <HOST_ALIAS>:<KAFKA_HOST_PORT> (EXTERNAL listener)
+      - "${KAFKA_HOST_PORT:-9093}:9095"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9093' 2>/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # 3. One-shot: create the demo topics (authenticates with client@REALM)
+  # ------------------------------------------------------------------
+  kafka-init:
+    build:
+      context: ./kafka-client
+      args:
+        KAFKA_IMAGE: ${KAFKA_IMAGE}
+    image: kafka-kerberos-solace/kafka-client
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment: &kafka-client-env
+      REALM: ${REALM}
+      KAFKA_BOOTSTRAP: kafka:9093
+      KAFKA_SERVICE_NAME: ${KAFKA_SERVICE_NAME}
+      CLIENT_PRINCIPAL: ${CLIENT_PRINCIPAL}
+    volumes: &kafka-client-volumes
+      - keytabs:/etc/kafka/keytabs:ro
+      - krb5conf:/etc/krb5:ro
+    command: ["create-topics", "${KAFKA_TOPIC_IN}", "${KAFKA_TOPIC_OUT}"]
+    restart: "no"
+
+  # ------------------------------------------------------------------
+  # 4. Kerberos-enabled Kafka CLI toolbox (idles; use `docker compose exec`)
+  #      docker compose exec kafka-client produce orders-in "hello"
+  #      docker compose exec kafka-client consume orders-out
+  # ------------------------------------------------------------------
+  kafka-client:
+    build:
+      context: ./kafka-client
+      args:
+        KAFKA_IMAGE: ${KAFKA_IMAGE}
+    image: kafka-kerberos-solace/kafka-client
+    container_name: kafka-client
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment: *kafka-client-env
+    volumes: *kafka-client-volumes
+    command: ["idle"]
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # 5. One-shot: configure the default VPN of YOUR Solace broker via SEMP v2
+  #    realm -> keytab -> kafka receiver/sender (Kerberos) -> bindings
+  #    Talks to https://<HOST_ALIAS>:1943 (= https://localhost:1943 on your PC),
+  #    polling up to 10 min until SEMP answers.
+  # ------------------------------------------------------------------
+  solace-config:
+    build: ./solace-tools
+    image: kafka-kerberos-solace/solace-tools
+    container_name: solace-config
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    extra_hosts: &host-alias
+      # Docker Desktop resolves host.docker.internal by itself; this makes it work on Linux too
+      - "host.docker.internal:host-gateway"
+    environment: &solace-tools-env
+      SEMP_URL: ${SOLACE_SEMP_SCHEME:-https}://${SOLACE_HOST}:${SOLACE_SEMP_PORT:-1943}
+      SEMP_INSECURE: ${SOLACE_SEMP_INSECURE:-true}
+      SEMP_USER: ${SOLACE_ADMIN_USER}
+      SEMP_PASSWORD: ${SOLACE_ADMIN_PASSWORD}
+      SOLACE_REST_URL: ${SOLACE_REST_SCHEME:-http}://${SOLACE_HOST}:${SOLACE_REST_PORT:-9000}
+      SOLACE_MQTT_HOST: ${SOLACE_HOST}
+      SOLACE_MQTT_PORT: ${SOLACE_MQTT_PORT}
+      SOLACE_CONTAINER: ${SOLACE_CONTAINER:-<solace-container>}
+      VPN: ${SOLACE_VPN}
+      REALM: ${REALM}
+      KDC_ADDRESS: ${KDC_ADDRESS_FOR_SOLACE}
+      KAFKA_BOOTSTRAP: ${KAFKA_BOOTSTRAP_FOR_SOLACE}
+      KAFKA_SERVICE_NAME: ${KAFKA_SERVICE_NAME}
+      SOLACE_PRINCIPAL: ${SOLACE_PRINCIPAL}
+      KEYTAB_FILE: /keytabs/solace.keytab
+      KAFKA_RECEIVER_NAME: ${KAFKA_RECEIVER_NAME}
+      KAFKA_SENDER_NAME: ${KAFKA_SENDER_NAME}
+      KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP}
+      KAFKA_TOPIC_IN: ${KAFKA_TOPIC_IN}
+      KAFKA_TOPIC_OUT: ${KAFKA_TOPIC_OUT}
+      SOLACE_QUEUE_FROM_KAFKA: ${SOLACE_QUEUE_FROM_KAFKA}
+      SOLACE_QUEUE_TO_KAFKA: ${SOLACE_QUEUE_TO_KAFKA}
+      SOLACE_TOPIC_TO_KAFKA: ${SOLACE_TOPIC_TO_KAFKA}
+      SOLACE_MAX_KAFKA_BRIDGES: ${SOLACE_MAX_KAFKA_BRIDGES}
+      SOLACE_MAX_KAFKA_BROKER_CONNECTIONS: ${SOLACE_MAX_KAFKA_BROKER_CONNECTIONS}
+    volumes:
+      - keytabs:/keytabs:ro
+    command: ["configure"]
+    restart: "no"
+
+  # ------------------------------------------------------------------
+  # 6. Solace toolbox (run on demand):
+  #      docker compose run --rm solace-tools status
+  #      docker compose run --rm solace-tools publish solace/orders/new "hi"
+  #      docker compose run --rm solace-tools peek "kafka/#" 20
+  # ------------------------------------------------------------------
+  solace-tools:
+    build: ./solace-tools
+    image: kafka-kerberos-solace/solace-tools
+    profiles: ["tools"]
+    extra_hosts: *host-alias
+    environment: *solace-tools-env
+    volumes:
+      - keytabs:/keytabs:ro
+    command: ["status"]
+
+volumes:
+  kdc-data:
+  keytabs:
+  krb5conf:

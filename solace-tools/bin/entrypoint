@@ -1,0 +1,28 @@
+#!/bin/bash
+# Dispatcher:  configure | status | publish | peek | events | export-keytab | help
+set -euo pipefail
+cmd="${1:-help}"; shift || true
+case "${cmd}" in
+  configure)     exec /opt/tools/configure "$@" ;;
+  status)        exec /opt/tools/status "$@" ;;
+  publish)       exec /opt/tools/publish "$@" ;;
+  peek)          exec /opt/tools/peek "$@" ;;
+  qcount)        exec /opt/tools/qcount "$@" ;;
+  export-keytab) exec /opt/tools/export-keytab "$@" ;;
+  sh|bash)       exec bash "$@" ;;
+  help|-h|--help)
+    cat <<'EOF'
+Solace toolbox commands (run with: docker compose run --rm solace-tools <cmd>)
+
+  configure [--keytab-by-name]      Realm -> keytab -> Kafka receiver/sender -> bindings (idempotent)
+                                    --keytab-by-name: reference files already in /usr/sw/jail/keytabs
+  status                            Bridge / realm / queue state from the SEMP v2 monitor API
+  publish <topic> <message>         Publish to Solace via REST (port 9000) - flows Solace -> Kafka
+  peek [topic-filter] [seconds]     Subscribe via MQTT and print messages (default kafka/# for 20s)
+  qcount [queue]                    Number of messages spooled on a queue (default q.from-kafka)
+  export-keytab                     Show the Solace keytab (klist) and print it as base64
+  bash                              Interactive shell
+EOF
+    ;;
+  *) exec "${cmd}" "$@" ;;
+esac

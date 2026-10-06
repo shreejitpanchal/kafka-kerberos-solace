@@ -1,0 +1,17 @@
+#!/bin/bash
+# Container entrypoint: `idle` keeps the toolbox alive for `docker compose exec`,
+# anything else is executed as a command (produce / consume / topics / ...).
+set -euo pipefail
+source /opt/tools/lib.sh
+write_client_props
+
+case "${1:-idle}" in
+  idle)
+    log "toolbox ready (bootstrap=${BOOTSTRAP}, principal=${CLIENT_PRINCIPAL}@${REALM})"
+    log "try: docker compose exec kafka-client produce <topic> \"message\""
+    exec sleep infinity
+    ;;
+  *)
+    exec "$@"
+    ;;
+esac

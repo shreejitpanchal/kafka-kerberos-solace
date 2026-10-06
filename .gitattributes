@@ -1,0 +1,8 @@
+# Scripts are executed inside Linux containers - they must stay LF.
+* text=auto eol=lf
+*.sh text eol=lf
+*.conf text eol=lf
+*.properties text eol=lf
+*.yml text eol=lf
+*.ps1 text eol=lf
+*.keytab binary

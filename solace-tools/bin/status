@@ -1,0 +1,45 @@
+#!/bin/bash
+# Show the Kerberos / Kafka-bridge state of the Message VPN (SEMP v2 monitor API)
+set -euo pipefail
+source /opt/tools/lib.sh
+wait_for_semp
+
+renc=$(urlenc "${RECEIVER}"); senc=$(urlenc "${SENDER}")
+
+# print only the interesting, non-counter attributes of a monitor object
+summary='.data // {} | with_entries(select((.key | test("Name$|^enabled$|^up$|Failure|Reason|State|Status|^bootstrap|^authentication(Scheme|Kerberos)|^groupId$|^kdcAddress$|^remoteTopic$|^localTopic$|^initialOffset$|^lastKafka|Count$|^msgSpoolUsage$")) and ((.key | test("^(rx|tx)")) | not)))'
+
+hr; echo "Kerberos realm           (CLI: show message-vpn ${VPN} kerberos realm @${REALM})"; hr
+mon_get "msgVpns/${VPN}/authenticationKerberosRealms/$(urlenc "@${REALM}")" "${summary}"
+
+hr; echo "Kafka receiver ${RECEIVER}   (CLI: show message-vpn ${VPN} kafka kafka-receiver ${RECEIVER} detail)"; hr
+mon_get "msgVpns/${VPN}/kafkaReceivers/${renc}" "${summary}"
+echo "-- topic bindings       (CLI: ... kafka-receiver ${RECEIVER} topic-binding)"
+mon_get "msgVpns/${VPN}/kafkaReceivers/${renc}/topicBindings" '.data[]? | {topicName, enabled, localTopic, initialOffset} + (with_entries(select(.key|test("up|Failure|Reason|State")))) '
+echo "-- remote Kafka brokers  (CLI: ... kafka-receiver ${RECEIVER} remote-broker)"
+mon_get "msgVpns/${VPN}/kafkaReceivers/${renc}/remoteKafkaBrokers" '.data[]? | with_entries(select(.key|test("Address|Name|^up$|Failure|Reason|State|Rtt|Time")))'
+
+hr; echo "Kafka sender ${SENDER}   (CLI: show message-vpn ${VPN} kafka kafka-sender ${SENDER} detail)"; hr
+mon_get "msgVpns/${VPN}/kafkaSenders/${senc}" "${summary}"
+echo "-- queue bindings       (CLI: ... kafka-sender ${SENDER} queue-binding)"
+mon_get "msgVpns/${VPN}/kafkaSenders/${senc}/queueBindings" '.data[]? | {queueName, enabled, remoteTopic, ackMode} + (with_entries(select(.key|test("up|Failure|Reason|State")))) '
+echo "-- remote Kafka brokers  (CLI: ... kafka-sender ${SENDER} remote-broker)"
+mon_get "msgVpns/${VPN}/kafkaSenders/${senc}/remoteKafkaBrokers" '.data[]? | with_entries(select(.key|test("Address|Name|^up$|Failure|Reason|State|Rtt|Time")))'
+
+hr; echo "Queues"; hr
+for q in "${Q_FROM_KAFKA}" "${Q_TO_KAFKA}"; do
+  mon_get "msgVpns/${VPN}/queues/$(urlenc "${q}")" '.data // {} | {queueName, spooledMsgCount, msgSpoolUsage, bindCount, ingressEnabled, egressEnabled}'
+done
+
+hr
+cat <<EOF
+Verify on the broker CLI (docker exec -it ${SOLACE_CONTAINER} /usr/sw/loads/currentload/bin/cli -A):
+  show kafka                                   (Max Kafka Bridges / Max Kafka Broker Connections must be > 0)
+  show message-vpn ${VPN} kerberos realm @${REALM}
+  show message-vpn ${VPN} kafka kafka-receiver ${RECEIVER} keytab
+  show message-vpn ${VPN} kafka kafka-receiver ${RECEIVER} remote-broker
+  show message-vpn ${VPN} kafka kafka-sender ${SENDER} keytab
+  (or from the host: scripts/solace-cli.sh "show message-vpn ${VPN} kafka")
+Event log (VPN_KAFKA_RECEIVER_UP / VPN_KAFKA_RECEIVER_DOWN / VPN_KAFKA_SENDER_*):
+  docker exec ${SOLACE_CONTAINER} grep -E "VPN_KAFKA|KERBEROS" /usr/sw/jail/logs/event.log | tail -n 30
+EOF

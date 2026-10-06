@@ -1,0 +1,9 @@
+#!/bin/bash
+# topics [describe]   - list (or describe) topics using Kerberos auth
+set -euo pipefail
+source /opt/tools/lib.sh
+if [ "${1:-list}" = "describe" ]; then
+  kafka-topics.sh --bootstrap-server "${BOOTSTRAP}" --command-config "${PROPS}" --describe
+else
+  kafka-topics.sh --bootstrap-server "${BOOTSTRAP}" --command-config "${PROPS}" --list
+fi

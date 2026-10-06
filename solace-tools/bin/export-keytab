@@ -1,0 +1,11 @@
+#!/bin/bash
+# export-keytab   - show the Solace bridge keytab (principal, enctypes) and its base64 form
+# Use the base64 output if you want to upload the keytab manually through SEMP, or copy
+# the raw files with:  scripts/export-keytabs.sh   (-> scripts/keytabs/solace-kafka-{receiver,sender}.keytab)
+set -euo pipefail
+source /opt/tools/lib.sh
+[ -r "${KEYTAB_FILE}" ] || die "keytab not found: ${KEYTAB_FILE}"
+hr; echo "Keytab: ${KEYTAB_FILE}  (UPN ${SOLACE_PRINCIPAL}@${REALM})"; hr
+klist -kte "${KEYTAB_FILE}" 2>/dev/null || echo "(klist not available)"
+hr; echo "base64:"; hr
+base64 -w0 < "${KEYTAB_FILE}"; echo

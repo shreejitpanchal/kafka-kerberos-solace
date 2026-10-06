@@ -1,0 +1,16 @@
+#!/bin/bash
+# publish <solace-topic> <message>   - publish a persistent message via Solace REST (port 9000)
+# Default flow: topic solace/orders/<anything> -> queue q.to-kafka -> Kafka topic orders-out
+set -euo pipefail
+source /opt/tools/lib.sh
+TOPIC="${1:-}"; MSG="${2:-}"
+[ -n "${TOPIC}" ] && [ -n "${MSG}" ] || { echo "usage: publish <solace-topic> <message>" >&2; exit 2; }
+
+code=$(curl -sS "${CURL_TLS[@]}" -o /dev/null -w '%{http_code}' -X POST "${SOLACE_REST_URL}/TOPIC/${TOPIC}" \
+  -H 'Content-Type: text/plain' -H 'Solace-Delivery-Mode: Persistent' -d "${MSG}" 2>/dev/null || true)
+code="${code:-000}"
+if [ "${code}" = "200" ]; then
+  log "published to Solace topic '${TOPIC}' (HTTP ${code}): ${MSG}"
+else
+  die "REST publish to ${SOLACE_REST_URL} failed with HTTP ${code} (is the REST service enabled on VPN ${VPN}? try SOLACE_REST_SCHEME=https SOLACE_REST_PORT=9443)"
+fi

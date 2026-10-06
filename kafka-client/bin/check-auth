@@ -1,0 +1,13 @@
+#!/bin/bash
+# check-auth   - prove the GSSAPI handshake works (verbose Kerberos trace on failure)
+set -euo pipefail
+source /opt/tools/lib.sh
+log "principal ${CLIENT_PRINCIPAL}@${REALM}, keytab ${CLIENT_KEYTAB}, bootstrap ${BOOTSTRAP}"
+if kafka-broker-api-versions.sh --bootstrap-server "${BOOTSTRAP}" --command-config "${PROPS}" >/dev/null 2>&1; then
+  log "OK - SASL/GSSAPI authentication to Kafka succeeded"
+  exit 0
+fi
+log "FAILED - re-running with Kerberos debug enabled:"
+KAFKA_OPTS="${KAFKA_OPTS} -Dsun.security.krb5.debug=true" \
+  kafka-broker-api-versions.sh --bootstrap-server "${BOOTSTRAP}" --command-config "${PROPS}" 2>&1 | tail -n 60
+exit 1

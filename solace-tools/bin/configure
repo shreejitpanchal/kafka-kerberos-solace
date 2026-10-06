@@ -1,0 +1,181 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+# Configure the Solace Message VPN for Kerberos-authenticated Kafka bridging.
+# Idempotent - safe to re-run. Order of operations (as per Solace Support):
+#
+#   1. Kerberos realm in the Message VPN  (@REALM, KDC address, enabled)
+#   2. Keytab into the broker's keytabs folder (/usr/sw/jail/keytabs)
+#        -> pushed as base64 via SEMP v2 "authenticationKerberosKeytabContent"
+#   3. Kafka receiver / sender with auth-scheme kerberos, service-name,
+#      user-principal-name + keytab file name, then topic / queue bindings
+# ---------------------------------------------------------------------------
+set -euo pipefail
+source /opt/tools/lib.sh
+
+# --keytab-by-name : do not upload the keytab content; only reference the file names
+#                    (use after copying the files to /usr/sw/jail/keytabs yourself,
+#                     see scripts/upload-keytab-manual.sh)
+KEYTAB_MODE="content"
+for arg in "$@"; do
+  case "${arg}" in
+    --keytab-by-name) KEYTAB_MODE="name" ;;
+    -h|--help) echo "usage: configure [--keytab-by-name]"; exit 0 ;;
+    *) die "unknown option: ${arg}" ;;
+  esac
+done
+
+hr; log "Solace Kafka-bridge configuration (VPN=${VPN}, realm=@${REALM}, broker=${SEMP_URL})"; hr
+wait_for_semp
+check_semp_version
+
+UPN="${SOLACE_PRINCIPAL}@${REALM}"
+KEYTAB_B64=""
+if [ "${KEYTAB_MODE}" = "content" ]; then
+  [ -r "${KEYTAB_FILE}" ] || die "keytab not found: ${KEYTAB_FILE} (is the kdc container healthy?)"
+  KEYTAB_B64=$(base64 -w0 < "${KEYTAB_FILE}")
+  log "keytab ${KEYTAB_FILE} ($(stat -c %s "${KEYTAB_FILE}") bytes) for UPN ${UPN} - uploaded via SEMP"
+else
+  log "keytab mode: BY NAME - expecting ${RECEIVER_KEYTAB_NAME} / ${SENDER_KEYTAB_NAME} already in /usr/sw/jail/keytabs"
+fi
+log "broker will reach KDC at ${KDC_ADDRESS} and Kafka at ${KAFKA_BOOTSTRAP}"
+
+# strip the content attribute when running in by-name mode
+keytab_filter() { if [ "${KEYTAB_MODE}" = "name" ]; then jq -c 'del(.authenticationKerberosKeytabContent)'; else cat; fi; }
+
+# ---------------------------------------------------------------------------
+# Step 1 - Kerberos realm on the Message VPN
+#   CLI: configure> message-vpn default> authentication> kerberos>
+#        create realm @SOLACE.LOCAL ; kdc-address kdc:88 ; no shutdown
+# ---------------------------------------------------------------------------
+hr; log "Step 1/4  Kerberos realm @${REALM} -> KDC ${KDC_ADDRESS}"
+semp_upsert "msgVpns/${VPN}/authenticationKerberosRealms" kerberosRealmName "$(jq -nc \
+  --arg realm "@${REALM}" --arg kdc "${KDC_ADDRESS}" \
+  '{kerberosRealmName:$realm, kdcAddress:$kdc, enabled:true}')"
+
+# ---------------------------------------------------------------------------
+# Step 2 - Queues used by the bridge
+# ---------------------------------------------------------------------------
+hr; log "Step 2/4  Queues"
+make_queue() {   # make_queue <name> <subscription>
+  local q="$1" sub="$2"
+  semp_upsert "msgVpns/${VPN}/queues" queueName "$(jq -nc --arg q "${q}" \
+    '{queueName:$q, accessType:"exclusive", permission:"consume",
+      ingressEnabled:true, egressEnabled:true, maxMsgSpoolUsage:500}')"
+  semp_upsert "msgVpns/${VPN}/queues/$(urlenc "${q}")/subscriptions" subscriptionTopic \
+    "$(jq -nc --arg t "${sub}" '{subscriptionTopic:$t}')"
+}
+# landing queue for records arriving from Kafka (Solace topic kafka/<kafka-topic>)
+make_queue "${Q_FROM_KAFKA}" "kafka/>"
+# source queue drained by the Kafka sender
+make_queue "${Q_TO_KAFKA}" "${TOPIC_TO_KAFKA}"
+
+# ---------------------------------------------------------------------------
+# Bridge objects: disable -> apply -> (re)enable, so attribute changes that are
+# "service impacting while enabled" are always accepted.
+# ---------------------------------------------------------------------------
+upsert_bridge() {   # upsert_bridge <collection> <key-attr> <json>
+  local coll="$1" keyattr="$2" body="$3"
+  local name enc status patch
+  name=$(echo "${body}" | jq -r ".${keyattr}"); enc=$(urlenc "${name}")
+  semp POST "${CFG}/${coll}" "${body}"
+  if [ "${HTTP_CODE}" = "200" ]; then log "created  ${coll}/${name}"; return 0; fi
+  status=$(echo "${RESP}" | jq -r '.meta.error.status // empty' 2>/dev/null || true)
+  if [ "${status}" != "ALREADY_EXISTS" ]; then
+    semp_err >&2
+    die "HTTP ${HTTP_CODE} creating ${coll}/${name}"
+  fi
+  semp PATCH "${CFG}/${coll}/${enc}" '{"enabled":false}'
+  [ "${HTTP_CODE}" = "200" ] || log "warning: could not disable ${name} before update ($(semp_err))"
+  patch=$(echo "${body}" | jq -c "del(.${keyattr})")
+  semp PATCH "${CFG}/${coll}/${enc}" "${patch}"
+  if [ "${HTTP_CODE}" = "200" ]; then log "updated  ${coll}/${name}"; return 0; fi
+  semp_err >&2
+  die "HTTP ${HTTP_CODE} updating ${coll}/${name}"
+}
+
+# ---------------------------------------------------------------------------
+# Step 3 - Kafka receiver  (Kafka -> Solace)
+#   CLI: configure> message-vpn default> kafka> create kafka-receiver <name>
+#          bootstrap-addresses kafka:9093
+#          authentication auth-scheme kerberos
+#          authentication kerberos service-name kafka
+#          authentication kerberos user-principal-name solace@REALM solace-kafka-receiver.keytab
+#          group id solace-bridge ; no shutdown
+#          create topic-binding orders-in ; local topic kafka/${kafkaTopic()} ; no shutdown
+# ---------------------------------------------------------------------------
+hr; log "Step 3/4  Kafka receiver ${RECEIVER}  (${TOPIC_IN} -> ${LOCAL_TOPIC_EXPR})"
+upsert_bridge "msgVpns/${VPN}/kafkaReceivers" kafkaReceiverName "$(jq -nc \
+  --arg name "${RECEIVER}" --arg boot "${KAFKA_BOOTSTRAP}" --arg svc "${KAFKA_SERVICE_NAME}" \
+  --arg upn "${UPN}" --arg kt "${RECEIVER_KEYTAB_NAME}" --arg b64 "${KEYTAB_B64}" \
+  --arg grp "${CONSUMER_GROUP}" \
+  '{kafkaReceiverName:$name,
+    bootstrapAddressList:$boot,
+    transportTlsEnabled:false,
+    authenticationScheme:"kerberos",
+    authenticationKerberosServiceName:$svc,
+    authenticationKerberosUserPrincipalName:$upn,
+    authenticationKerberosKeytabFileName:$kt,
+    authenticationKerberosKeytabContent:$b64,
+    groupId:$grp,
+    enabled:true}' | keytab_filter)"
+
+semp_upsert "msgVpns/${VPN}/kafkaReceivers/$(urlenc "${RECEIVER}")/topicBindings" topicName "$(jq -nc \
+  --arg t "${TOPIC_IN}" --arg lt "${LOCAL_TOPIC_EXPR}" \
+  '{topicName:$t, localTopic:$lt, initialOffset:"beginning", enabled:true}')"
+
+# ---------------------------------------------------------------------------
+# Step 4 - Kafka sender  (Solace -> Kafka)
+#   CLI: configure> message-vpn default> kafka> create kafka-sender <name>
+#          bootstrap-addresses kafka:9093
+#          authentication auth-scheme kerberos
+#          authentication kerberos service-name kafka
+#          authentication kerberos user-principal-name solace@REALM solace-kafka-sender.keytab
+#          no shutdown
+#          create queue-binding q.to-kafka ; remote topic orders-out ; ack-mode all ; no shutdown
+# ---------------------------------------------------------------------------
+hr; log "Step 4/4  Kafka sender ${SENDER}  (${Q_TO_KAFKA} -> ${TOPIC_OUT})"
+upsert_bridge "msgVpns/${VPN}/kafkaSenders" kafkaSenderName "$(jq -nc \
+  --arg name "${SENDER}" --arg boot "${KAFKA_BOOTSTRAP}" --arg svc "${KAFKA_SERVICE_NAME}" \
+  --arg upn "${UPN}" --arg kt "${SENDER_KEYTAB_NAME}" --arg b64 "${KEYTAB_B64}" \
+  '{kafkaSenderName:$name,
+    bootstrapAddressList:$boot,
+    transportTlsEnabled:false,
+    authenticationScheme:"kerberos",
+    authenticationKerberosServiceName:$svc,
+    authenticationKerberosUserPrincipalName:$upn,
+    authenticationKerberosKeytabFileName:$kt,
+    authenticationKerberosKeytabContent:$b64,
+    idempotenceEnabled:false,
+    enabled:true}' | keytab_filter)"
+
+semp_upsert "msgVpns/${VPN}/kafkaSenders/$(urlenc "${SENDER}")/queueBindings" queueName "$(jq -nc \
+  --arg q "${Q_TO_KAFKA}" --arg rt "${TOPIC_OUT}" \
+  '{queueName:$q, remoteTopic:$rt, ackMode:"all", partitionScheme:"consistent", enabled:true}')"
+
+# ---------------------------------------------------------------------------
+# Wait for the bridge to come up, then show status
+# ---------------------------------------------------------------------------
+hr; log "waiting for ${RECEIVER} / ${SENDER} to connect to Kafka with Kerberos ..."
+# NOTE: do not use  .data.up // "n/a"  here - jq's // treats false like null, so a receiver
+# that is still connecting (up=false) would look like "field not exposed" and end the wait early.
+UP_FILTER='if (.data|type)=="object" and (.data|has("up")) then (.data.up|tostring) else "n/a" end'
+r_up="n/a"; s_up="n/a"
+for _ in $(seq 1 24); do
+  r_up=$(mon_get "msgVpns/${VPN}/kafkaReceivers/$(urlenc "${RECEIVER}")" "${UP_FILTER}")
+  s_up=$(mon_get "msgVpns/${VPN}/kafkaSenders/$(urlenc "${SENDER}")" "${UP_FILTER}")
+  if [ "${r_up}" = "true" ] && [ "${s_up}" = "true" ]; then
+    log "receiver up=${r_up}, sender up=${s_up}"; break
+  fi
+  if [ "${r_up}" = "n/a" ]; then break; fi   # field not exposed on this release
+  sleep 5
+done
+if [ "${r_up}" = "false" ] || [ "${s_up}" = "false" ]; then
+  hr
+  log "bridge not up yet (receiver up=${r_up}, sender up=${s_up}). Most common causes:"
+  log "  1. Kafka scaling parameters still 0 on the broker  -> scripts/solace-enable-kafka-scaling.sh"
+  log "     (needs max-kafka-bridges >= ${SOLACE_MAX_KAFKA_BRIDGES:-10}, max-kafka-broker-connections >= ${SOLACE_MAX_KAFKA_BROKER_CONNECTIONS:-300})"
+  log "  2. broker cannot resolve/reach ${KDC_ADDRESS} or ${KAFKA_BOOTSTRAP}  -> scripts/check-solace.sh"
+  log "  3. Kerberos: SPN must be ${KAFKA_SERVICE_NAME}/${KAFKA_BOOTSTRAP%%:*}@${REALM} (in kafka.keytab); check the event log:"
+  log "     docker exec ${SOLACE_CONTAINER} grep -E 'VPN_KAFKA|KERBEROS' /usr/sw/jail/logs/event.log | tail"
+fi
+exec /opt/tools/status
